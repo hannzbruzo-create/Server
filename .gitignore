@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+serviceAccountKey.json
+serviceAccountKey.json.json
+*serviceAccount*.json
+
+# SQLite data (including write-ahead logs)
+evacuation.db
+*.db-shm
+*.db-wal
+
+# Local TextBee dispatch/testing locks
+.textbee-test-send-lock.json
+
+# Logs
+*.log

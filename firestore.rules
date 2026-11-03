@@ -1,0 +1,41 @@
+rules_version = '2';
+
+// TomaSafe Firestore rules. Paste into Firebase console > Firestore Database > Rules > Publish.
+// Phones sign in anonymously and may only write their own documents; the PC server
+// (firebase-admin) is not limited by these rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function activeAlert() {
+      return get(/databases/$(database)/documents/meta/activeIncident).data;
+    }
+
+    // Each phone's push token, name and ID number.
+    match /devices/{uid} {
+      allow read, delete: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['token', 'name', 'idNumber', 'platform', 'updatedAt'])
+        && request.resource.data.token is string && request.resource.data.token.size() < 4096
+        && request.resource.data.name is string && request.resource.data.name.size() <= 80;
+    }
+
+    // Which alert is active (written by the PC server).
+    match /meta/activeIncident {
+      allow read: if signedIn();
+    }
+
+    // A phone's status for the active alert only; statuses never go backwards.
+    match /incidents/{incidentId}/status/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && activeAlert().active == true && activeAlert().id == incidentId
+        && request.resource.data.status in ['navigating', 'arrived', 'safe_confirmed']
+        && request.resource.data.rank is int
+        && (resource == null || request.resource.data.rank >= resource.data.rank);
+    }
+  }
+}
