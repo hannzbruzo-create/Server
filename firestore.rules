@@ -14,13 +14,37 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/meta/activeIncident).data;
     }
 
-    // Each phone's push token, name and ID number.
+    // The sign-in fields shared by devices and profiles. phone, recipientType and
+    // androidId are optional so older app versions can still register.
+    function validSignIn(data) {
+      return data.name is string && data.name.size() >= 2 && data.name.size() <= 80
+        && (!('idNumber' in data) || data.idNumber == null || (data.idNumber is string && data.idNumber.size() <= 40))
+        && (!('phone' in data) || (data.phone is string && data.phone.matches('^09[0-9]{9}$')))
+        && (!('recipientType' in data) || data.recipientType in ['student', 'faculty', 'campus_personnel'])
+        && (!('androidId' in data) || (data.androidId is string && data.androidId.matches('^[A-Za-z0-9-]{8,64}$')));
+    }
+
+    // Each phone's push token and its owner's sign-in.
     match /devices/{uid} {
       allow read, delete: if signedIn() && request.auth.uid == uid;
       allow create, update: if signedIn() && request.auth.uid == uid
-        && request.resource.data.keys().hasOnly(['token', 'name', 'idNumber', 'platform', 'updatedAt'])
+        && request.resource.data.keys().hasOnly(['token', 'name', 'idNumber', 'phone', 'recipientType', 'androidId', 'platform', 'updatedAt'])
         && request.resource.data.token is string && request.resource.data.token.size() < 4096
-        && request.resource.data.name is string && request.resource.data.name.size() <= 80;
+        && validSignIn(request.resource.data);
+    }
+
+    // The sign-in, keyed by the phone's Android ID, which survives an app reinstall,
+    // so a reinstalled app can restore it. Readable only by id (no listing): the
+    // Android ID is a random 64-bit value per phone and app signing key. Only the
+    // PC server deletes these (when an admin deletes the recipient).
+    match /profiles/{androidId} {
+      allow get: if signedIn();
+      allow create, update: if signedIn()
+        && request.resource.data.keys().hasOnly(['name', 'idNumber', 'phone', 'recipientType', 'uid', 'updatedAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.phone is string
+        && request.resource.data.recipientType is string
+        && validSignIn(request.resource.data);
     }
 
     // Which alert is active (written by the PC server).

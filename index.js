@@ -371,29 +371,106 @@ function cleanAppText(value, max) {
 }
 
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
+const PH_MOBILE_PATTERN = /^09\d{9}$/;
+const allowedRecipientTypes = [
+  "student",
+  "faculty",
+  "campus_personnel",
+];
+
+// The sign-in fields the app sends with its push registration. Each value is
+// undefined when missing (older app versions) and null when invalid.
+function cleanAppOwner({ deviceId, name, idNumber, phone, recipientType, androidId }) {
+  const optional = (value, valid) =>
+    (value == null || value === "" ? undefined : (valid(String(value).trim()) ? String(value).trim() : null));
+  return {
+    deviceId: optional(deviceId, (v) => DEVICE_ID_PATTERN.test(v)),
+    name: cleanAppText(name, 80),
+    idNumber: cleanAppText(idNumber, 40),
+    phone: optional(phone, (v) => PH_MOBILE_PATTERN.test(v)),
+    recipientType: optional(recipientType, (v) => allowedRecipientTypes.includes(v)),
+    androidId: optional(androidId, (v) => DEVICE_ID_PATTERN.test(v)),
+  };
+}
+
+// The recipient a phone's owner signed in as. Matched by phone number, so a
+// recipient the admin already added is linked instead of duplicated. When the
+// owner changes their number, the recipient only this phone uses is updated.
+function linkAppRecipient(token, owner) {
+  let id = db.prepare("SELECT id FROM recipients WHERE phone_number = ? ORDER BY id LIMIT 1")
+    .get(owner.phone)?.id;
+  if (!id) {
+    const previous = db.prepare(`
+      SELECT recipient_id FROM devices
+      WHERE recipient_id IS NOT NULL AND (fcm_token = ? OR (? IS NOT NULL AND android_id = ?))
+      LIMIT 1
+    `).get(token, owner.androidId ?? null, owner.androidId ?? null);
+    if (previous) {
+      const { others } = db.prepare(`
+        SELECT COUNT(*) AS others FROM devices
+        WHERE recipient_id = ? AND fcm_token <> ? AND (? IS NULL OR android_id IS NULL OR android_id <> ?)
+      `).get(previous.recipient_id, token, owner.androidId ?? null, owner.androidId ?? null);
+      if (!others) id = previous.recipient_id;
+    }
+  }
+  if (id) {
+    const result = db.prepare(`
+      UPDATE recipients
+      SET recipient_type = ?, name = ?, phone_number = ?, id_number = COALESCE(?, id_number),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(owner.recipientType, owner.name, owner.phone, owner.idNumber ?? null, id);
+    if (result.changes) return id;
+  }
+  return Number(db.prepare(`
+    INSERT INTO recipients (recipient_type, name, phone_number, id_number, updated_at)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+  `).run(owner.recipientType, owner.name, owner.phone, owner.idNumber ?? null).lastInsertRowid);
+}
 
 // Save a phone's push token with its owner. A rotated token (same device id)
-// replaces the phone's old registration. Used by the HTTP route and by the
-// Firestore sync (firebaseSync.js), where the device id is the Firebase uid.
+// or a reinstalled app (same Android ID) replaces the phone's old registration.
+// With a phone number and type, the owner is also saved as a recipient (SMS)
+// and linked to this phone. Used by the HTTP route and by the Firestore sync
+// (firebaseSync.js), where the device id is the Firebase uid.
 function saveDeviceRegistration(token, owner) {
-  db.transaction(() => {
+  return db.transaction(() => {
+    const recipientId = owner.name && owner.phone && owner.recipientType
+      ? linkAppRecipient(token, owner)
+      : null;
+    // Keep the date the phone first registered. Re-saves (the Firestore sync
+    // replays every device on server start), rotated tokens and reinstalls
+    // must not reset it to "now".
+    const firstRegistered = db.prepare(`
+      SELECT MIN(registered_at) AS at FROM devices
+      WHERE fcm_token = ? OR device_id = ? OR android_id = ?
+    `).get(token, owner.deviceId ?? null, owner.androidId ?? null).at;
     if (owner.deviceId) {
       db.prepare("DELETE FROM devices WHERE device_id = ? AND fcm_token <> ?")
         .run(owner.deviceId, token);
     }
+    if (owner.androidId) {
+      db.prepare("DELETE FROM devices WHERE android_id = ? AND fcm_token <> ?")
+        .run(owner.androidId, token);
+    }
     db.prepare(`
-      INSERT INTO devices (fcm_token, device_id, name, id_number) VALUES (?, ?, ?, ?)
+      INSERT INTO devices (fcm_token, device_id, name, id_number, recipient_id, android_id,
+        registered_at)
+      VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
       ON CONFLICT(fcm_token) DO UPDATE SET
-        registered_at = CURRENT_TIMESTAMP,
         device_id = COALESCE(excluded.device_id, device_id),
         name = COALESCE(excluded.name, name),
-        id_number = COALESCE(excluded.id_number, id_number)
-    `).run(token, owner.deviceId ?? null, owner.name ?? null, owner.idNumber ?? null);
+        id_number = COALESCE(excluded.id_number, id_number),
+        recipient_id = COALESCE(excluded.recipient_id, recipient_id),
+        android_id = COALESCE(excluded.android_id, android_id)
+    `).run(token, owner.deviceId ?? null, owner.name ?? null, owner.idNumber ?? null,
+      recipientId, owner.androidId ?? null, firstRegistered ?? null);
+    return recipientId;
   })();
 }
 
 app.post("/api/devices/register", (req, res) => {
-  const { token, deviceId, name, idNumber } = req.body || {};
+  const { token } = req.body || {};
 
   if (typeof token !== "string" || !token.trim() || token.length > 4096) {
     return res.status(400).json({
@@ -402,17 +479,13 @@ app.post("/api/devices/register", (req, res) => {
     });
   }
 
-  // The owner's name and ID number (entered once in the app) let admins see
-  // whose phone this is. Older token-only clients still register.
-  const owner = {
-    deviceId: deviceId == null ? undefined : (DEVICE_ID_PATTERN.test(String(deviceId)) ? String(deviceId) : null),
-    name: cleanAppText(name, 80),
-    idNumber: cleanAppText(idNumber, 40),
-  };
+  // The owner's sign-in (name, ID number, phone, type) lets admins see whose
+  // phone this is and texts them too. Older clients without it still register.
+  const owner = cleanAppOwner(req.body);
   if (Object.values(owner).includes(null)) {
     return res.status(400).json({
       success: false,
-      message: "Device id, name or ID number is not valid",
+      message: "Device id, name, ID number, phone number or type is not valid",
     });
   }
 
@@ -463,30 +536,69 @@ app.post("/api/devices/unregister", (req, res) => {
   }
 });
 
+// The signed-in profile linked to a phone's Android ID, so a reinstalled app
+// can restore it without asking again (direct route; Firestore is the main one).
+app.get("/api/app/profile", (req, res) => {
+  const deviceId = String(req.query.deviceId ?? "");
+  if (!DEVICE_ID_PATTERN.test(deviceId)) {
+    return res.status(400).json({ success: false, message: "A valid device id is required" });
+  }
+  try {
+    const recipient = db.prepare(`
+      SELECT r.name, r.id_number, r.phone_number, r.recipient_type
+      FROM devices d JOIN recipients r ON r.id = d.recipient_id
+      WHERE d.android_id = ?
+      ORDER BY d.registered_at DESC LIMIT 1
+    `).get(deviceId);
+    return res.json({
+      success: true,
+      profile: recipient
+        ? {
+          name: recipient.name, idNumber: recipient.id_number ?? "",
+          phone: recipient.phone_number, recipientType: recipient.recipient_type,
+        }
+        : null,
+    });
+  } catch (error) {
+    console.error("App profile error:", error.message);
+    return res.status(500).json({ success: false, message: "Could not load the profile" });
+  }
+});
+
 // ==========================================
 // RECIPIENT MANAGEMENT
 // ==========================================
-
-const allowedRecipientTypes = [
-  "student",
-  "faculty",
-  "campus_personnel",
-];
+// One list for SMS: people the admin adds by hand, and people who signed in
+// on the mobile app (linked to their phone through devices.recipient_id).
 
 function validateRecipient(body) {
-  const { recipient_type, name, phone_number } = body || {};
+  const { recipient_type, name, phone_number, id_number } = body || {};
 
   if (
     !allowedRecipientTypes.includes(recipient_type) ||
     typeof name !== "string" ||
     !name.trim() ||
+    name.trim().length > 80 ||
     typeof phone_number !== "string" ||
-    !/^09\d{9}$/.test(phone_number.trim())
+    !PH_MOBILE_PATTERN.test(phone_number.trim()) ||
+    cleanAppText(id_number, 40) === null
   ) {
     return "Enter a valid recipient type, name, and 11-digit Philippine mobile number.";
   }
 
   return null;
+}
+
+function phoneTaken(phone, exceptId = 0) {
+  return Boolean(db.prepare("SELECT 1 FROM recipients WHERE phone_number = ? AND id <> ?")
+    .get(phone, exceptId));
+}
+
+// Phones linked to a recipient, for keeping their Firestore copies in step.
+function linkedDevices(recipientId) {
+  return db.prepare(`
+    SELECT device_id, android_id FROM devices WHERE recipient_id = ?
+  `).all(recipientId);
 }
 
 // ==========================================
@@ -496,14 +608,24 @@ function validateRecipient(body) {
 app.get("/api/recipients", authenticateAdmin, (req, res) => {
   try {
     const recipients = db.prepare(`
-      SELECT id, recipient_type, name, phone_number, created_at
-      FROM recipients
-      ORDER BY name COLLATE NOCASE ASC
+      SELECT r.id, r.recipient_type, r.name, r.id_number, r.phone_number, r.created_at,
+        COUNT(d.id) AS app_devices, MAX(d.registered_at) AS app_registered_at
+      FROM recipients r
+      LEFT JOIN devices d ON d.recipient_id = r.id
+      GROUP BY r.id
+      ORDER BY r.name COLLATE NOCASE ASC
     `).all();
+
+    // App installs from before sign-in asked for a phone number.
+    const { unlinked } = db.prepare(`
+      SELECT COUNT(*) AS unlinked FROM devices
+      WHERE recipient_id IS NULL OR recipient_id NOT IN (SELECT id FROM recipients)
+    `).get();
 
     return res.json({
       success: true,
       recipients,
+      unlinked_devices: unlinked,
     });
 
   } catch (error) {
@@ -530,20 +652,30 @@ app.post("/api/recipients", authenticateAdmin, (req, res) => {
     });
   }
 
-  const { recipient_type, name, phone_number } = req.body;
+  const { recipient_type, name, phone_number, id_number } = req.body;
+
+  if (phoneTaken(phone_number.trim())) {
+    return res.status(409).json({
+      success: false,
+      message: "A recipient with this contact number already exists.",
+    });
+  }
 
   try {
     const result = db.prepare(`
       INSERT INTO recipients (
         recipient_type,
         name,
-        phone_number
+        phone_number,
+        id_number,
+        updated_at
       )
-      VALUES (?, ?, ?)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
     `).run(
       recipient_type,
       name.trim(),
-      phone_number.trim()
+      phone_number.trim(),
+      cleanAppText(id_number, 40) ?? null
     );
 
     const recipient = db.prepare(`
@@ -590,7 +722,14 @@ app.put("/api/recipients/:id", authenticateAdmin, (req, res) => {
     });
   }
 
-  const { recipient_type, name, phone_number } = req.body;
+  const { recipient_type, name, phone_number, id_number } = req.body;
+
+  if (phoneTaken(phone_number.trim(), id)) {
+    return res.status(409).json({
+      success: false,
+      message: "Another recipient already has this contact number.",
+    });
+  }
 
   try {
     const result = db.prepare(`
@@ -598,12 +737,15 @@ app.put("/api/recipients/:id", authenticateAdmin, (req, res) => {
       SET
         recipient_type = ?,
         name = ?,
-        phone_number = ?
+        phone_number = ?,
+        id_number = ?,
+        updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(
       recipient_type,
       name.trim(),
       phone_number.trim(),
+      cleanAppText(id_number, 40) ?? null,
       id
     );
 
@@ -619,6 +761,19 @@ app.put("/api/recipients/:id", authenticateAdmin, (req, res) => {
       FROM recipients
       WHERE id = ?
     `).get(id);
+
+    // Keep the device rows and the phones' Firestore copies in step, so the
+    // app shows the edit and a later sync does not bring the old values back.
+    db.prepare("UPDATE devices SET name = ?, id_number = ? WHERE recipient_id = ?")
+      .run(recipient.name, recipient.id_number, id);
+    for (const device of linkedDevices(id)) {
+      firebaseSync.publishProfile(device, {
+        name: recipient.name,
+        idNumber: recipient.id_number ?? "",
+        phone: recipient.phone_number,
+        recipientType: recipient.recipient_type,
+      });
+    }
 
     return res.json({
       success: true,
@@ -639,6 +794,8 @@ app.put("/api/recipients/:id", authenticateAdmin, (req, res) => {
 // ==========================================
 // DELETE RECIPIENT
 // ==========================================
+// Also removes the recipient's app registrations (push stops). If that phone
+// signs in again, it comes back as a new recipient.
 
 app.delete("/api/recipients/:id", authenticateAdmin, (req, res) => {
   const id = Number(req.params.id);
@@ -651,10 +808,14 @@ app.delete("/api/recipients/:id", authenticateAdmin, (req, res) => {
   }
 
   try {
-    const result = db.prepare(`
-      DELETE FROM recipients
-      WHERE id = ?
-    `).run(id);
+    const devices = linkedDevices(id);
+    const result = db.transaction(() => {
+      db.prepare("DELETE FROM devices WHERE recipient_id = ?").run(id);
+      return db.prepare(`
+        DELETE FROM recipients
+        WHERE id = ?
+      `).run(id);
+    })();
 
     if (result.changes === 0) {
       return res.status(404).json({
@@ -662,6 +823,8 @@ app.delete("/api/recipients/:id", authenticateAdmin, (req, res) => {
         message: "Recipient not found",
       });
     }
+
+    for (const device of devices) firebaseSync.deleteProfile(device);
 
     return res.json({
       success: true,
@@ -1237,6 +1400,53 @@ app.get("/api/alerts/history", authenticateAdmin, (req, res) => {
   }
 });
 
+// ==========================================
+// DELETE ONE ALERT HISTORY RECORD
+// ==========================================
+// key is the one the history list gives each row: "incident-<id>" (an alert
+// with safety monitoring, removed with its status reports and its alert_history
+// row) or "alert-<id>" (an older alert_history row). The active alert cannot be
+// deleted: close it first.
+
+app.delete("/api/alerts/history/:key", authenticateAdmin, (req, res) => {
+  const match = /^(incident|alert)-(\d+)$/.exec(String(req.params.key));
+  if (!match) return res.status(400).json({ success: false, message: "Invalid history record" });
+  const [, kind, rawId] = match;
+  const id = Number(rawId);
+  try {
+    const result = db.transaction(() => {
+      if (kind === "incident") {
+        const incident = incidentById(id);
+        if (!incident) return "missing";
+        if (incident.status === "active") return "active";
+        db.prepare("DELETE FROM device_status WHERE incident_id = ?").run(id);
+        db.prepare("DELETE FROM incidents WHERE id = ?").run(id);
+        if (incident.alert_id) {
+          db.prepare("UPDATE incidents SET alert_id = NULL WHERE alert_id = ?").run(incident.alert_id);
+          db.prepare("DELETE FROM alert_history WHERE id = ?").run(incident.alert_id);
+        }
+        return "deleted";
+      }
+      const linkedActive = db.prepare(
+        "SELECT 1 FROM incidents WHERE alert_id = ? AND status = 'active'"
+      ).get(id);
+      if (linkedActive) return "active";
+      db.prepare("UPDATE incidents SET alert_id = NULL WHERE alert_id = ?").run(id);
+      const { changes } = db.prepare("DELETE FROM alert_history WHERE id = ?").run(id);
+      return changes ? "deleted" : "missing";
+    })();
+    if (result === "missing") return res.status(404).json({ success: false, message: "Record not found" });
+    if (result === "active") {
+      return res.status(409).json({ success: false, message: "This alert is still active. Close it before deleting it." });
+    }
+    console.log(`Alert history ${req.params.key} deleted by ${req.admin.name}`);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Delete alert history error:", error.message);
+    return res.status(500).json({ success: false, message: "Could not delete the record" });
+  }
+});
+
 
 
 // ==========================================
@@ -1332,7 +1542,7 @@ app.post("/api/sms/test", authenticateAdmin, async (req, res) => {
 // Phones on any network register and report through Firestore; copy that
 // into SQLite so the admin panel and push sending work the same way.
 const firebaseSync = startFirebaseSync({
-  cleanAppText, DEVICE_ID_PATTERN, APP_STATUSES,
+  cleanAppText, cleanAppOwner, DEVICE_ID_PATTERN, APP_STATUSES,
   saveDeviceRegistration, saveStatusReport, getActiveIncident,
 });
 

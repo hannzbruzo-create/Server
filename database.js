@@ -63,7 +63,13 @@ const deviceColumns = db.prepare(`
   PRAGMA table_info(devices)
 `).all().map((column) => column.name);
 
-for (const [name, type] of [["device_id", "TEXT"], ["name", "TEXT"], ["id_number", "TEXT"]]) {
+// recipient_id links the phone to the recipient its owner signed in as (by
+// phone number). android_id is the phone's Android ID, which survives an app
+// reinstall, so a reinstalled app replaces its old row instead of adding one.
+for (const [name, type] of [
+  ["device_id", "TEXT"], ["name", "TEXT"], ["id_number", "TEXT"],
+  ["recipient_id", "INTEGER"], ["android_id", "TEXT"],
+]) {
   if (!deviceColumns.includes(name)) {
     db.prepare(`ALTER TABLE devices ADD COLUMN ${name} ${type}`).run();
     console.log(`Devices column added: ${name}`);
@@ -95,6 +101,23 @@ db.prepare(`
 `).run();
 
 console.log("Recipients table ready");
+
+// Recipients now also come from the mobile app's sign-in (name, ID number,
+// phone, type), so they carry the ID number too.
+const recipientColumns = db.prepare(`
+  PRAGMA table_info(recipients)
+`).all().map((column) => column.name);
+
+for (const [name, type] of [["id_number", "TEXT"], ["updated_at", "DATETIME"]]) {
+  if (!recipientColumns.includes(name)) {
+    db.prepare(`ALTER TABLE recipients ADD COLUMN ${name} ${type}`).run();
+    console.log(`Recipients column added: ${name}`);
+  }
+}
+
+db.prepare("CREATE INDEX IF NOT EXISTS idx_recipients_phone ON recipients (phone_number)").run();
+db.prepare("CREATE INDEX IF NOT EXISTS idx_devices_android_id ON devices (android_id)").run();
+db.prepare("CREATE INDEX IF NOT EXISTS idx_devices_recipient ON devices (recipient_id)").run();
 
 // ==========================================
 // ALERT HISTORY
